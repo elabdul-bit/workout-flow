@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 
 // ─── Exercise Library ─────────────────────────────────────────────────────────
 const EXERCISE_LIBRARY = {
@@ -206,18 +206,41 @@ function getProgressiveLoad(history, exerciseName, prescription, mode) {
     : getProgressiveLoad_Linear(history, exerciseName, prescription);
 }
 
-// ─── Storage helpers ──────────────────────────────────────────────────────────
-async function storageGet(key) {
-  try { const r = await window.storage.get(key); return r?.value ? JSON.parse(r.value) : null; } catch { return null; }
+// ─── Storage — ALL shared so data survives across sessions ───────────────────
+// Keys:
+//   wf3:users          → { [username]: { hash } }          (shared)
+//   wf3:session        → { username }                       (shared)
+//   wf3:data:[user]    → { templates, history, settings }  (shared)
+
+const SK = {
+  users:    "wf3:users",
+  session:  "wf3:session",
+  data:     u => `wf3:data:${u}`,
+};
+
+async function sGet(key) {
+  try {
+    const r = await window.storage.get(key, true);
+    if (!r || !r.value) return null;
+    return JSON.parse(r.value);
+  } catch { return null; }
 }
-async function storageSet(key, val) {
-  try { await window.storage.set(key, JSON.stringify(val)); } catch {}
+
+async function sSet(key, val) {
+  try {
+    await window.storage.set(key, JSON.stringify(val), true);
+    return true;
+  } catch { return false; }
 }
-async function storageGetShared(key) {
-  try { const r = await window.storage.get(key, true); return r?.value ? JSON.parse(r.value) : null; } catch { return null; }
-}
-async function storageSetShared(key, val) {
-  try { await window.storage.set(key, JSON.stringify(val), true); } catch {}
+
+function hashPass(username, password) {
+  // Simple deterministic hash — not cryptographic but sufficient for this use case
+  const str = `${username}|${password}|wf3`;
+  let h = 0;
+  for (let i = 0; i < str.length; i++) {
+    h = Math.imul(31, h) + str.charCodeAt(i) | 0;
+  }
+  return h.toString(36);
 }
 
 // ─── Colors ───────────────────────────────────────────────────────────────────
@@ -244,28 +267,41 @@ function AuthScreen({ onLogin }) {
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [storageOk, setStorageOk] = useState(null); // null=checking, true, false
+
+  // Test storage on mount
+  useEffect(() => {
+    async function test() {
+      const ok = await sSet("wf3:ping", { t: Date.now() });
+      setStorageOk(ok);
+    }
+    test();
+  }, []);
 
   const handleSubmit = async () => {
     setError(""); setLoading(true);
-    const u = username.trim().toLowerCase().replace(/\s+/g, "_");
+    const u = username.trim().toLowerCase().replace(/[^a-z0-9_]/g, "_");
     const p = password.trim();
-    if (!u || !p) { setError("Please fill in both fields."); setLoading(false); return; }
+    if (!u || !p) { setError("Fill in both fields."); setLoading(false); return; }
     if (u.length < 3) { setError("Username must be at least 3 characters."); setLoading(false); return; }
     if (p.length < 4) { setError("Password must be at least 4 characters."); setLoading(false); return; }
 
-    const usersKey = "wf-users-registry-v2";
-    const users = (await storageGetShared(usersKey)) || {};
+    const users = (await sGet(SK.users)) || {};
+    const hash = hashPass(u, p);
 
     if (mode === "signup") {
-      if (users[u]) { setError("Username already taken. Try logging in."); setLoading(false); return; }
-      const hashed = btoa(unescape(encodeURIComponent(p + u + "wf-salt-2024")));
-      users[u] = { passwordHash: hashed, createdAt: Date.now() };
-      await storageSetShared(usersKey, users);
+      if (users[u]) { setError("Username taken. Try logging in."); setLoading(false); return; }
+      users[u] = { hash, created: Date.now() };
+      const saved = await sSet(SK.users, users);
+      if (!saved) { setError("Storage error — could not save account."); setLoading(false); return; }
+      // Initialize empty data for new user
+      await sSet(SK.data(u), { templates: [], history: [], settings: { age:"", sex:"", weight:"", progressionMode:"linear" } });
+      await sSet(SK.session, { username: u });
       onLogin(u);
     } else {
       if (!users[u]) { setError("No account found. Sign up first."); setLoading(false); return; }
-      const hashed = btoa(unescape(encodeURIComponent(p + u + "wf-salt-2024")));
-      if (users[u].passwordHash !== hashed) { setError("Incorrect password."); setLoading(false); return; }
+      if (users[u].hash !== hash) { setError("Incorrect password."); setLoading(false); return; }
+      await sSet(SK.session, { username: u });
       onLogin(u);
     }
     setLoading(false);
@@ -279,6 +315,12 @@ function AuthScreen({ onLogin }) {
         <div style={{color:C.muted,fontSize:14,marginTop:4}}>Track. Analyze. Progress.</div>
       </div>
 
+      {storageOk === false && (
+        <div style={{background:"#3b1515",border:`1px solid ${C.danger}`,borderRadius:12,color:C.danger,fontSize:13,padding:"12px 16px",marginBottom:16,maxWidth:380,width:"100%",textAlign:"center",lineHeight:1.5}}>
+          ⚠️ Storage unavailable. Accounts won't persist. Try refreshing the page.
+        </div>
+      )}
+
       <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:20,padding:24,width:"100%",maxWidth:380}}>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:24,background:C.inputBg,borderRadius:12,padding:4}}>
           {["login","signup"].map(m=>(
@@ -291,21 +333,21 @@ function AuthScreen({ onLogin }) {
 
         <div style={{marginBottom:14}}>
           <div style={{color:C.mutedLight,fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.8px",marginBottom:6}}>Username</div>
-          <input type="text" placeholder="your_username" value={username} onChange={e=>setUsername(e.target.value)}
-            onKeyDown={e=>e.key==="Enter"&&handleSubmit()}
+          <input type="text" placeholder="your_username" value={username}
+            onChange={e=>setUsername(e.target.value)} onKeyDown={e=>e.key==="Enter"&&handleSubmit()}
             style={{...IS,textAlign:"left",padding:"11px 14px",fontSize:15,borderRadius:10,width:"100%"}}/>
         </div>
         <div style={{marginBottom:20}}>
           <div style={{color:C.mutedLight,fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.8px",marginBottom:6}}>Password</div>
-          <input type="password" placeholder="••••••••" value={password} onChange={e=>setPassword(e.target.value)}
-            onKeyDown={e=>e.key==="Enter"&&handleSubmit()}
+          <input type="password" placeholder="••••••••" value={password}
+            onChange={e=>setPassword(e.target.value)} onKeyDown={e=>e.key==="Enter"&&handleSubmit()}
             style={{...IS,textAlign:"left",padding:"11px 14px",fontSize:15,borderRadius:10,width:"100%"}}/>
         </div>
 
-        {error&&<div style={{background:"#3b1515",border:`1px solid ${C.danger}44`,borderRadius:9,color:C.danger,fontSize:13,padding:"9px 14px",marginBottom:16,textAlign:"center"}}>{error}</div>}
+        {error && <div style={{background:"#3b1515",border:`1px solid ${C.danger}44`,borderRadius:9,color:C.danger,fontSize:13,padding:"9px 14px",marginBottom:16,textAlign:"center"}}>{error}</div>}
 
-        <button onClick={handleSubmit} disabled={loading}
-          style={{background:C.accent,border:"none",borderRadius:12,color:"#fff",cursor:loading?"default":"pointer",fontSize:15,fontWeight:700,padding:"14px",width:"100%",opacity:loading?0.6:1}}>
+        <button onClick={handleSubmit} disabled={loading || storageOk===false}
+          style={{background:C.accent,border:"none",borderRadius:12,color:"#fff",cursor:loading?"default":"pointer",fontSize:15,fontWeight:700,padding:"14px",width:"100%",opacity:(loading||storageOk===false)?0.6:1}}>
           {loading?"…":mode==="login"?"Log In →":"Create Account →"}
         </button>
 
@@ -521,8 +563,8 @@ function TemplateBuilder({initial,onSave,onCancel}) {
   const [description,setDescription]=useState(initial?.description||"");
   const [exercises,setExercises]=useState(initial?.exercises||[]);
   const [showPicker,setShowPicker]=useState(false);
-  const addExercise=(n,v)=>setExercises([...exercises,{name:n,variant:v,prescription:{sets:3,reps:5,rpe:8}}]);
-  const updatePx=(idx,f,v)=>{const u=[...exercises];u[idx].prescription={...u[idx].prescription,[f]:parseFloat(v)||v};setExercises(u);};
+  const addEx=(n,v)=>setExercises([...exercises,{name:n,variant:v,prescription:{sets:3,reps:5,rpe:8}}]);
+  const updPx=(idx,f,v)=>{const u=[...exercises];u[idx].prescription={...u[idx].prescription,[f]:parseFloat(v)||v};setExercises(u);};
   const canSave=name.trim()&&exercises.length>0;
   return (
     <div style={{flex:1,overflowY:"auto",paddingBottom:100,background:C.bg}}>
@@ -551,11 +593,11 @@ function TemplateBuilder({initial,onSave,onCancel}) {
                   <button onClick={()=>setExercises(exercises.filter((_,i)=>i!==idx))} style={{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:18,padding:0}}>×</button>
                 </div>
                 <div style={{display:"grid",gridTemplateColumns:"1fr 22px 1fr 22px 1fr",alignItems:"center",gap:6}}>
-                  <div><div style={{color:C.muted,fontSize:9,textAlign:"center",marginBottom:3,textTransform:"uppercase"}}>Sets</div><input type="number" value={ex.prescription.sets} onChange={e=>updatePx(idx,"sets",e.target.value)} style={{...IS,fontSize:14}}/></div>
+                  <div><div style={{color:C.muted,fontSize:9,textAlign:"center",marginBottom:3,textTransform:"uppercase"}}>Sets</div><input type="number" value={ex.prescription.sets} onChange={e=>updPx(idx,"sets",e.target.value)} style={{...IS,fontSize:14}}/></div>
                   <span style={{color:C.muted,fontSize:13,textAlign:"center"}}>×</span>
-                  <div><div style={{color:C.muted,fontSize:9,textAlign:"center",marginBottom:3,textTransform:"uppercase"}}>Reps</div><input type="number" value={ex.prescription.reps} onChange={e=>updatePx(idx,"reps",e.target.value)} style={{...IS,fontSize:14}}/></div>
+                  <div><div style={{color:C.muted,fontSize:9,textAlign:"center",marginBottom:3,textTransform:"uppercase"}}>Reps</div><input type="number" value={ex.prescription.reps} onChange={e=>updPx(idx,"reps",e.target.value)} style={{...IS,fontSize:14}}/></div>
                   <span style={{color:C.muted,fontSize:13,textAlign:"center"}}>@</span>
-                  <div><div style={{color:C.muted,fontSize:9,textAlign:"center",marginBottom:3,textTransform:"uppercase"}}>RPE</div><select value={ex.prescription.rpe} onChange={e=>updatePx(idx,"rpe",e.target.value)} style={{...IS,appearance:"none",fontSize:14}}>{RPE_KEYS.map(r=><option key={r} value={r}>{r}</option>)}</select></div>
+                  <div><div style={{color:C.muted,fontSize:9,textAlign:"center",marginBottom:3,textTransform:"uppercase"}}>RPE</div><select value={ex.prescription.rpe} onChange={e=>updPx(idx,"rpe",e.target.value)} style={{...IS,appearance:"none",fontSize:14}}>{RPE_KEYS.map(r=><option key={r} value={r}>{r}</option>)}</select></div>
                 </div>
               </div>
             ))}
@@ -563,7 +605,7 @@ function TemplateBuilder({initial,onSave,onCancel}) {
         )}
         <button onClick={()=>setShowPicker(true)} style={{background:C.accentDim,border:`1px dashed ${C.accent}`,borderRadius:12,color:C.accent,cursor:"pointer",fontSize:14,fontWeight:700,padding:"14px",width:"100%"}}>+ Add Exercise</button>
       </div>
-      {showPicker&&<ExercisePicker onSelect={(n,v)=>{addExercise(n,v);setShowPicker(false);}} onClose={()=>setShowPicker(false)}/>}
+      {showPicker&&<ExercisePicker onSelect={(n,v)=>{addEx(n,v);setShowPicker(false);}} onClose={()=>setShowPicker(false)}/>}
     </div>
   );
 }
@@ -575,12 +617,12 @@ function PreWorkoutReview({template,history,onConfirm,onCancel,progressionMode})
   const build=()=>template.exercises.map(ex=>{
     const prog=getProgressiveLoad(history,ex.name,ex.prescription,progressionMode);
     const {sets:n,rpe}=ex.prescription;
-    return {id:Math.random(),name:ex.name,variant:ex.variant,prescription:ex.prescription,notes:"",_progLabel:prog.label,
+    return {id:Math.random(),name:ex.name,variant:ex.variant,prescription:ex.prescription,_progLabel:prog.label,
       sets:Array.from({length:n},()=>({id:Math.random(),weight:prog.weight?String(prog.weight):"",reps:String(prog.reps),rpe:String(rpe)}))};
   });
   const [exercises,setExercises]=useState(build);
   const [showPicker,setShowPicker]=useState(false);
-  const updateEx=(idx,ex)=>{const u=[...exercises];u[idx]=ex;setExercises(u);};
+  const updEx=(idx,ex)=>{const u=[...exercises];u[idx]=ex;setExercises(u);};
   return (
     <div style={{flex:1,overflowY:"auto",paddingBottom:100,background:C.bg}}>
       <div style={{padding:"14px 16px",borderBottom:`1px solid ${C.border}`,display:"flex",justifyContent:"space-between",alignItems:"flex-start",position:"sticky",top:0,background:C.bg,zIndex:10}}>
@@ -603,10 +645,7 @@ function PreWorkoutReview({template,history,onConfirm,onCancel,progressionMode})
         {exercises.map((ex,idx)=>(
           <div key={ex.id} style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,marginBottom:14,overflow:"hidden"}}>
             <div style={{padding:"11px 14px 8px",borderBottom:`1px solid ${C.border}`,display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
-              <div>
-                <div style={{color:C.accent,fontSize:15,fontWeight:700}}>{ex.name}</div>
-                <div style={{color:C.mutedLight,fontSize:12,marginTop:2}}>{ex.variant}</div>
-              </div>
+              <div><div style={{color:C.accent,fontSize:15,fontWeight:700}}>{ex.name}</div><div style={{color:C.mutedLight,fontSize:12,marginTop:2}}>{ex.variant}</div></div>
               <div style={{textAlign:"right"}}>
                 <div style={{color:C.purple,fontSize:12,fontWeight:700}}>{ex.prescription.sets}×{ex.prescription.reps} @ RPE {ex.prescription.rpe}</div>
                 {ex._progLabel&&<div style={{color:C.success,fontSize:10,marginTop:2}}>↑ {ex._progLabel}</div>}
@@ -619,21 +658,21 @@ function PreWorkoutReview({template,history,onConfirm,onCancel,progressionMode})
               {ex.sets.map((set,si)=>(
                 <div key={set.id} style={{display:"grid",gridTemplateColumns:"26px 1fr 22px 1fr 22px 1fr 22px",alignItems:"center",gap:3,padding:"5px 0",borderBottom:`1px solid ${C.border}`}}>
                   <span style={{color:C.muted,fontSize:12,textAlign:"center",fontWeight:700}}>{si+1}</span>
-                  <input type="number" value={set.weight} onChange={e=>{const s=[...ex.sets];s[si]={...set,weight:e.target.value};updateEx(idx,{...ex,sets:s});}} style={IS}/>
+                  <input type="number" value={set.weight} onChange={e=>{const s=[...ex.sets];s[si]={...set,weight:e.target.value};updEx(idx,{...ex,sets:s});}} style={IS}/>
                   <span style={{color:C.muted,fontSize:11,textAlign:"center"}}>×</span>
-                  <input type="number" value={set.reps} onChange={e=>{const s=[...ex.sets];s[si]={...set,reps:e.target.value};updateEx(idx,{...ex,sets:s});}} style={IS}/>
+                  <input type="number" value={set.reps} onChange={e=>{const s=[...ex.sets];s[si]={...set,reps:e.target.value};updEx(idx,{...ex,sets:s});}} style={IS}/>
                   <span style={{color:C.muted,fontSize:11,textAlign:"center"}}>@</span>
-                  <select value={set.rpe} onChange={e=>{const s=[...ex.sets];s[si]={...set,rpe:e.target.value};updateEx(idx,{...ex,sets:s});}} style={{...IS,appearance:"none"}}>{RPE_KEYS.map(r=><option key={r} value={r}>{r}</option>)}</select>
-                  <button onClick={()=>updateEx(idx,{...ex,sets:ex.sets.filter((_,i)=>i!==si)})} style={{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:14,padding:0,textAlign:"center"}}>×</button>
+                  <select value={set.rpe} onChange={e=>{const s=[...ex.sets];s[si]={...set,rpe:e.target.value};updEx(idx,{...ex,sets:s});}} style={{...IS,appearance:"none"}}>{RPE_KEYS.map(r=><option key={r} value={r}>{r}</option>)}</select>
+                  <button onClick={()=>updEx(idx,{...ex,sets:ex.sets.filter((_,i)=>i!==si)})} style={{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:14,padding:0,textAlign:"center"}}>×</button>
                 </div>
               ))}
             </div>
-            <button onClick={()=>{const last=ex.sets[ex.sets.length-1];updateEx(idx,{...ex,sets:[...ex.sets,{...last,id:Math.random()}]});}} style={{background:"none",border:"none",color:C.accent,cursor:"pointer",fontSize:13,fontWeight:700,padding:"8px 14px",width:"100%",textAlign:"center"}}>+ Add set</button>
+            <button onClick={()=>{const last=ex.sets[ex.sets.length-1];updEx(idx,{...ex,sets:[...ex.sets,{...last,id:Math.random()}]});}} style={{background:"none",border:"none",color:C.accent,cursor:"pointer",fontSize:13,fontWeight:700,padding:"8px 14px",width:"100%",textAlign:"center"}}>+ Add set</button>
           </div>
         ))}
         <button onClick={()=>setShowPicker(true)} style={{background:C.accentDim,border:`1px dashed ${C.accent}`,borderRadius:12,color:C.accent,cursor:"pointer",fontSize:14,fontWeight:700,padding:14,width:"100%"}}>+ Add Extra Exercise</button>
       </div>
-      {showPicker&&<ExercisePicker onSelect={(n,v)=>{setExercises([...exercises,{id:Math.random(),name:n,variant:v,prescription:null,notes:"",sets:[{weight:"",reps:"",rpe:"",id:Math.random()},{weight:"",reps:"",rpe:"",id:Math.random()}]}]);setShowPicker(false);}} onClose={()=>setShowPicker(false)}/>}
+      {showPicker&&<ExercisePicker onSelect={(n,v)=>{setExercises([...exercises,{id:Math.random(),name:n,variant:v,prescription:null,sets:[{weight:"",reps:"",rpe:"",id:Math.random()},{weight:"",reps:"",rpe:"",id:Math.random()}]}]);setShowPicker(false);}} onClose={()=>setShowPicker(false)}/>}
     </div>
   );
 }
@@ -644,7 +683,7 @@ function PreWorkoutReview({template,history,onConfirm,onCancel,progressionMode})
 function LiveWorkoutScreen({exercises:initial,workoutTitle,onFinish,onCancel}) {
   const [exercises,setExercises]=useState(initial);
   const [showPicker,setShowPicker]=useState(false);
-  const updateEx=(idx,ex)=>{const u=[...exercises];u[idx]=ex;setExercises(u);};
+  const updEx=(idx,ex)=>{const u=[...exercises];u[idx]=ex;setExercises(u);};
   return (
     <div style={{flex:1,overflowY:"auto",paddingBottom:80,background:C.bg}}>
       <div style={{padding:"14px 16px",borderBottom:`1px solid ${C.border}`,display:"flex",justifyContent:"space-between",alignItems:"center",position:"sticky",top:0,background:C.bg,zIndex:10}}>
@@ -654,22 +693,22 @@ function LiveWorkoutScreen({exercises:initial,workoutTitle,onFinish,onCancel}) {
       </div>
       <div style={{padding:"14px 16px"}}>
         {exercises.length===0&&<div style={{textAlign:"center",padding:"40px 20px",color:C.muted}}><div style={{fontSize:36,marginBottom:10}}>🏋️</div><div style={{fontSize:14}}>Tap below to add your first exercise</div></div>}
-        {exercises.map((ex,idx)=><ExerciseCard key={ex.id} exercise={ex} onChange={e=>updateEx(idx,e)} onDelete={()=>setExercises(exercises.filter((_,i)=>i!==idx))}/>)}
+        {exercises.map((ex,idx)=><ExerciseCard key={ex.id} exercise={ex} onChange={e=>updEx(idx,e)} onDelete={()=>setExercises(exercises.filter((_,i)=>i!==idx))}/>)}
         <button onClick={()=>setShowPicker(true)} style={{background:C.accentDim,border:`1px dashed ${C.accent}`,borderRadius:12,color:C.accent,cursor:"pointer",fontSize:14,fontWeight:700,padding:14,width:"100%"}}>+ Add Exercise</button>
       </div>
-      {showPicker&&<ExercisePicker onSelect={(n,v)=>{setExercises([...exercises,{id:Math.random(),name:n,variant:v,prescription:null,notes:"",sets:[{weight:"",reps:"",rpe:"",id:Math.random()},{weight:"",reps:"",rpe:"",id:Math.random()},{weight:"",reps:"",rpe:"",id:Math.random()}]}]);setShowPicker(false);}} onClose={()=>setShowPicker(false)}/>}
+      {showPicker&&<ExercisePicker onSelect={(n,v)=>{setExercises([...exercises,{id:Math.random(),name:n,variant:v,prescription:null,sets:[{weight:"",reps:"",rpe:"",id:Math.random()},{weight:"",reps:"",rpe:"",id:Math.random()},{weight:"",reps:"",rpe:"",id:Math.random()}]}]);setShowPicker(false);}} onClose={()=>setShowPicker(false)}/>}
     </div>
   );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// HOME SCREEN
+// HOME
 // ═══════════════════════════════════════════════════════════════════════════════
 function HomeScreen({onStartEmpty,username}) {
   return (
     <div style={{flex:1,overflowY:"auto",paddingBottom:80}}>
       <div style={{padding:"24px 16px 16px",borderBottom:`1px solid ${C.border}`}}>
-        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:4}}>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
           <span style={{fontSize:28}}>🏋️</span>
           <div>
             <div style={{color:C.text,fontSize:22,fontWeight:800,letterSpacing:"-0.5px"}}>Workout Flow</div>
@@ -679,8 +718,7 @@ function HomeScreen({onStartEmpty,username}) {
       </div>
       <div style={{padding:16}}>
         <button onClick={onStartEmpty} style={{background:C.accentDim,border:`1px solid ${C.accent}`,borderRadius:14,color:C.accent,cursor:"pointer",fontSize:16,fontWeight:700,padding:"22px",width:"100%",textAlign:"center",marginBottom:14}}>
-          <div style={{fontSize:30,marginBottom:6}}>➕</div>
-          Start Empty Workout
+          <div style={{fontSize:30,marginBottom:6}}>➕</div>Start Empty Workout
         </button>
         <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,padding:"18px 16px",textAlign:"center",color:C.muted,fontSize:14,lineHeight:1.6}}>
           <div style={{fontSize:30,marginBottom:10}}>📋</div>
@@ -692,7 +730,7 @@ function HomeScreen({onStartEmpty,username}) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// HISTORY SCREEN
+// HISTORY
 // ═══════════════════════════════════════════════════════════════════════════════
 function HistoryScreen({history,onDelete}) {
   const [confirmId,setConfirmId]=useState(null);
@@ -703,13 +741,7 @@ function HistoryScreen({history,onDelete}) {
         <div style={{color:C.muted,fontSize:13,marginTop:2}}>{history.length} workout{history.length!==1?"s":""} logged</div>
       </div>
       <div style={{padding:16}}>
-        {history.length===0&&(
-          <div style={{textAlign:"center",padding:"60px 20px",color:C.muted}}>
-            <div style={{fontSize:48,marginBottom:12}}>📋</div>
-            <div style={{fontSize:15,fontWeight:600,color:C.mutedLight}}>No workouts logged yet</div>
-            <div style={{fontSize:13,marginTop:4}}>Finish a workout to see it here</div>
-          </div>
-        )}
+        {history.length===0&&<div style={{textAlign:"center",padding:"60px 20px",color:C.muted}}><div style={{fontSize:48,marginBottom:12}}>📋</div><div style={{fontSize:15,fontWeight:600,color:C.mutedLight}}>No workouts logged yet</div></div>}
         {history.map(w=>(
           <div key={w.id} style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,padding:16,marginBottom:12}}>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10}}>
@@ -749,7 +781,7 @@ function HistoryScreen({history,onDelete}) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// RPE CALC SCREEN
+// RPE CALC
 // ═══════════════════════════════════════════════════════════════════════════════
 function getHistorySets(history) {
   const map={};
@@ -759,20 +791,19 @@ function getHistorySets(history) {
   }));
   return map;
 }
-
 function RPECalcScreen({history}) {
-  const historySets=getHistorySets(history);
-  const exNames=Object.keys(historySets);
-  const [source,setSource]=useState("manual");
+  const hs=getHistorySets(history);
+  const exNames=Object.keys(hs);
+  const [src,setSrc]=useState("manual");
   const [mW,setMW]=useState(""); const [mR,setMR]=useState(""); const [mRpe,setMRpe]=useState("");
   const [selEx,setSelEx]=useState(exNames[0]||""); const [selIdx,setSelIdx]=useState(0);
   const [hov,setHov]=useState(null);
   let bW,bR,bRpe;
-  if(source==="manual"){bW=parseFloat(mW);bR=parseFloat(mR);bRpe=parseFloat(mRpe);}
-  else{const s=(historySets[selEx]||[])[selIdx]||{};bW=s.weight;bR=s.reps;bRpe=s.rpe;}
+  if(src==="manual"){bW=parseFloat(mW);bR=parseFloat(mR);bRpe=parseFloat(mRpe);}
+  else{const s=(hs[selEx]||[])[selIdx]||{};bW=s.weight;bR=s.reps;bRpe=s.rpe;}
   const e1rm=calc1RM(bW,bR,bRpe);
-  const cellBg=w=>{if(!w||!e1rm)return C.card;const p=w/e1rm;if(p>=0.95)return"#3b1515";if(p>=0.90)return"#2d2010";if(p>=0.85)return"#1a2a0d";if(p>=0.80)return"#0d2a1a";return C.card;};
-  const cellFg=w=>{if(!w||!e1rm)return C.muted;const p=w/e1rm;if(p>=0.95)return C.danger;if(p>=0.90)return C.warning;if(p>=0.85)return"#a3e635";if(p>=0.80)return C.success;return C.mutedLight;};
+  const cBg=w=>{if(!w||!e1rm)return C.card;const p=w/e1rm;if(p>=0.95)return"#3b1515";if(p>=0.90)return"#2d2010";if(p>=0.85)return"#1a2a0d";if(p>=0.80)return"#0d2a1a";return C.card;};
+  const cFg=w=>{if(!w||!e1rm)return C.muted;const p=w/e1rm;if(p>=0.95)return C.danger;if(p>=0.90)return C.warning;if(p>=0.85)return"#a3e635";if(p>=0.80)return C.success;return C.mutedLight;};
   return (
     <div style={{flex:1,overflowY:"auto",paddingBottom:80}}>
       <div style={{padding:"20px 16px 12px",borderBottom:`1px solid ${C.border}`}}>
@@ -782,10 +813,10 @@ function RPECalcScreen({history}) {
       <div style={{padding:16}}>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:14}}>
           {[{id:"manual",l:"✏️ Manual"},{id:"history",l:"📋 History"}].map(s=>(
-            <button key={s.id} onClick={()=>setSource(s.id)} style={{background:source===s.id?C.accentDim:C.card,border:`1px solid ${source===s.id?C.accent:C.border}`,borderRadius:10,color:source===s.id?C.accent:C.muted,cursor:"pointer",fontSize:13,fontWeight:700,padding:"9px 8px"}}>{s.l}</button>
+            <button key={s.id} onClick={()=>setSrc(s.id)} style={{background:src===s.id?C.accentDim:C.card,border:`1px solid ${src===s.id?C.accent:C.border}`,borderRadius:10,color:src===s.id?C.accent:C.muted,cursor:"pointer",fontSize:13,fontWeight:700,padding:"9px 8px"}}>{s.l}</button>
           ))}
         </div>
-        {source==="manual"?(
+        {src==="manual"?(
           <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:13,padding:14,marginBottom:14}}>
             <div style={{color:C.mutedLight,fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.8px",marginBottom:10}}>Reference Lift</div>
             <div style={{display:"grid",gridTemplateColumns:"1fr 20px 1fr 20px 1fr",alignItems:"center",gap:6}}>
@@ -803,7 +834,7 @@ function RPECalcScreen({history}) {
             {exNames.length===0?<div style={{color:C.muted,fontSize:14,textAlign:"center",padding:"12px 0"}}>No history yet.</div>:(
               <>
                 <select value={selEx} onChange={e=>{setSelEx(e.target.value);setSelIdx(0);}} style={{...IS,textAlign:"left",padding:"7px 10px",marginBottom:10,fontSize:13}}>{exNames.map(n=><option key={n} value={n}>{n}</option>)}</select>
-                {(historySets[selEx]||[]).map((s,i)=>{
+                {(hs[selEx]||[]).map((s,i)=>{
                   const e=calc1RM(s.weight,s.reps,s.rpe);
                   return <div key={i} onClick={()=>setSelIdx(i)} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 10px",borderRadius:8,marginBottom:5,cursor:"pointer",background:selIdx===i?C.accentDim:C.inputBg,border:`1px solid ${selIdx===i?C.accent:C.inputBorder}`}}>
                     <div><span style={{color:C.text,fontSize:13,fontWeight:700}}>{s.weight}×{s.reps}@{s.rpe}</span><div style={{color:C.muted,fontSize:11}}>{s.variant}·{s.date}</div></div>
@@ -831,7 +862,7 @@ function RPECalcScreen({history}) {
                   {RPE_KEYS.slice().reverse().map(rpe=>(
                     <tr key={rpe}>
                       <td style={{padding:"5px 8px",color:hov?.rpe===rpe?C.accent:C.mutedLight,fontSize:12,fontWeight:700,textAlign:"center",background:hov?.rpe===rpe?C.accentDim:C.inputBg,borderBottom:`1px solid ${C.border}`,borderRight:`1px solid ${C.border}`,position:"sticky",left:0}}>{rpe}</td>
-                      {REP_KEYS.map(reps=>{const w=calcWeight(e1rm,reps,rpe);const isH=hov?.rpe===rpe&&hov?.reps===reps;return <td key={reps} onMouseEnter={()=>setHov({rpe,reps})} onMouseLeave={()=>setHov(null)} style={{padding:"5px 3px",textAlign:"center",fontSize:isH?13:12,fontWeight:isH?800:600,color:cellFg(w),background:cellBg(w),borderBottom:`1px solid ${C.border}`,cursor:"default",outline:isH?"1px solid #ffffff20":"none",outlineOffset:-1}}>{w||"—"}</td>;})}
+                      {REP_KEYS.map(reps=>{const w=calcWeight(e1rm,reps,rpe);const isH=hov?.rpe===rpe&&hov?.reps===reps;return <td key={reps} onMouseEnter={()=>setHov({rpe,reps})} onMouseLeave={()=>setHov(null)} style={{padding:"5px 3px",textAlign:"center",fontSize:isH?13:12,fontWeight:isH?800:600,color:cFg(w),background:cBg(w),borderBottom:`1px solid ${C.border}`,cursor:"default",outline:isH?"1px solid #ffffff20":"none",outlineOffset:-1}}>{w||"—"}</td>;})}
                     </tr>
                   ))}
                 </tbody>
@@ -852,21 +883,21 @@ function RPECalcScreen({history}) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// PROGRESS SCREEN
+// PROGRESS
 // ═══════════════════════════════════════════════════════════════════════════════
 function ProgressScreen({history}) {
-  const allExercises=[...new Set(history.flatMap(w=>w.exercises.map(e=>e.name)))];
-  const [selEx,setSelEx]=useState(allExercises[0]||"");
-  useEffect(()=>{if(allExercises.length&&!allExercises.includes(selEx))setSelEx(allExercises[0]);},[history]);
-  const dataPoints=[];
+  const all=[...new Set(history.flatMap(w=>w.exercises.map(e=>e.name)))];
+  const [selEx,setSelEx]=useState(all[0]||"");
+  useEffect(()=>{if(all.length&&!all.includes(selEx))setSelEx(all[0]);},[history]);
+  const pts=[];
   history.slice().reverse().forEach(w=>{
     w.exercises.forEach(ex=>{
-      if(ex.name===selEx){const best=Math.max(0,...ex.sets.map(s=>calc1RM(s.weight,s.reps,s.rpe)||0));if(best>0)dataPoints.push({date:w.date,e1rm:best});}
+      if(ex.name===selEx){const b=Math.max(0,...ex.sets.map(s=>calc1RM(s.weight,s.reps,s.rpe)||0));if(b>0)pts.push({date:w.date,e1rm:b});}
     });
   });
-  const H=150,W=300,vals=dataPoints.map(d=>d.e1rm);
-  const minV=vals.length?Math.max(0,Math.min(...vals)-20):0,maxV=vals.length?Math.max(...vals)+20:100;
-  const toY=v=>H-((v-minV)/(maxV-minV))*H;
+  const H=150,W=300,vs=pts.map(d=>d.e1rm);
+  const mn=vs.length?Math.max(0,Math.min(...vs)-20):0,mx=vs.length?Math.max(...vs)+20:100;
+  const toY=v=>H-((v-mn)/(mx-mn))*H;
   return (
     <div style={{flex:1,overflowY:"auto",paddingBottom:80}}>
       <div style={{padding:"20px 16px 12px",borderBottom:`1px solid ${C.border}`}}>
@@ -874,41 +905,24 @@ function ProgressScreen({history}) {
         <div style={{color:C.muted,fontSize:13,marginTop:2}}>E1RM over time by exercise</div>
       </div>
       <div style={{padding:16}}>
-        {allExercises.length===0?(
-          <div style={{textAlign:"center",padding:"60px 20px",color:C.muted}}>
-            <div style={{fontSize:48,marginBottom:12}}>📈</div>
-            <div style={{fontSize:15,fontWeight:600,color:C.mutedLight}}>No data yet</div>
-          </div>
-        ):(
+        {all.length===0?<div style={{textAlign:"center",padding:"60px 20px",color:C.muted}}><div style={{fontSize:48,marginBottom:12}}>📈</div><div style={{fontSize:15,fontWeight:600,color:C.mutedLight}}>No data yet</div></div>:(
           <>
-            <select value={selEx} onChange={e=>setSelEx(e.target.value)} style={{...IS,textAlign:"left",padding:"9px 14px",fontSize:14,marginBottom:14,width:"100%",borderRadius:10}}>{allExercises.map(n=><option key={n} value={n}>{n}</option>)}</select>
-            {dataPoints.length>0?(
+            <select value={selEx} onChange={e=>setSelEx(e.target.value)} style={{...IS,textAlign:"left",padding:"9px 14px",fontSize:14,marginBottom:14,width:"100%",borderRadius:10}}>{all.map(n=><option key={n} value={n}>{n}</option>)}</select>
+            {pts.length>0?(
               <>
                 <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,padding:14,marginBottom:14}}>
                   <svg width="100%" viewBox={`0 0 ${W} ${H+24}`} style={{display:"block"}}>
-                    {[minV,Math.round((minV+maxV)/2),maxV].map(v=>(
-                      <g key={v}><line x1="20" y1={toY(v)} x2={W} y2={toY(v)} stroke={C.border} strokeWidth="1"/><text x="0" y={toY(v)+4} fill={C.muted} fontSize="8">{v}</text></g>
-                    ))}
-                    {dataPoints.length>1&&<polyline points={dataPoints.map((d,i)=>`${20+(i/(dataPoints.length-1))*(W-30)},${toY(d.e1rm)}`).join(" ")} fill="none" stroke={C.accent} strokeWidth="2" strokeLinejoin="round"/>}
-                    {dataPoints.map((d,i)=>(
-                      <g key={i}>
-                        <circle cx={20+(dataPoints.length>1?i/(dataPoints.length-1):0.5)*(W-30)} cy={toY(d.e1rm)} r="4" fill={C.accent}/>
-                        <text x={20+(dataPoints.length>1?i/(dataPoints.length-1):0.5)*(W-30)} y={H+18} fill={C.muted} fontSize="8" textAnchor="middle">{d.date.slice(5)}</text>
-                      </g>
-                    ))}
+                    {[mn,Math.round((mn+mx)/2),mx].map(v=><g key={v}><line x1="20" y1={toY(v)} x2={W} y2={toY(v)} stroke={C.border} strokeWidth="1"/><text x="0" y={toY(v)+4} fill={C.muted} fontSize="8">{v}</text></g>)}
+                    {pts.length>1&&<polyline points={pts.map((d,i)=>`${20+(i/(pts.length-1))*(W-30)},${toY(d.e1rm)}`).join(" ")} fill="none" stroke={C.accent} strokeWidth="2" strokeLinejoin="round"/>}
+                    {pts.map((d,i)=><g key={i}><circle cx={20+(pts.length>1?i/(pts.length-1):0.5)*(W-30)} cy={toY(d.e1rm)} r="4" fill={C.accent}/><text x={20+(pts.length>1?i/(pts.length-1):0.5)*(W-30)} y={H+18} fill={C.muted} fontSize="8" textAnchor="middle">{d.date.slice(5)}</text></g>)}
                   </svg>
                 </div>
                 <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,padding:"14px 16px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                   <div><div style={{color:C.text,fontSize:15,fontWeight:700}}>{selEx}</div><div style={{color:C.muted,fontSize:12}}>Best E1RM</div></div>
-                  <div style={{textAlign:"right"}}>
-                    <div style={{color:C.accent,fontSize:22,fontWeight:800}}>{Math.max(...vals)} lbs</div>
-                    {dataPoints.length>1&&<div style={{color:vals[vals.length-1]>=vals[0]?C.success:C.danger,fontSize:12}}>{vals[vals.length-1]>=vals[0]?"+":""}{vals[vals.length-1]-vals[0]} lbs total</div>}
-                  </div>
+                  <div style={{textAlign:"right"}}><div style={{color:C.accent,fontSize:22,fontWeight:800}}>{Math.max(...vs)} lbs</div>{pts.length>1&&<div style={{color:vs[vs.length-1]>=vs[0]?C.success:C.danger,fontSize:12}}>{vs[vs.length-1]>=vs[0]?"+":""}{vs[vs.length-1]-vs[0]} lbs total</div>}</div>
                 </div>
               </>
-            ):(
-              <div style={{background:C.card,border:`1px dashed ${C.border}`,borderRadius:14,padding:"40px 20px",textAlign:"center",color:C.muted,fontSize:14}}>No logged sets for {selEx} yet</div>
-            )}
+            ):<div style={{background:C.card,border:`1px dashed ${C.border}`,borderRadius:14,padding:"40px 20px",textAlign:"center",color:C.muted,fontSize:14}}>No logged sets for {selEx} yet</div>}
           </>
         )}
       </div>
@@ -917,21 +931,15 @@ function ProgressScreen({history}) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SETTINGS SCREEN
+// SETTINGS
 // ═══════════════════════════════════════════════════════════════════════════════
 function SettingsScreen({settings,onSave,username,onLogout}) {
   const [age,setAge]=useState(settings.age||"");
   const [sex,setSex]=useState(settings.sex||"");
   const [weight,setWeight]=useState(settings.weight||"");
-  const [progressionMode,setProgressionMode]=useState(settings.progressionMode||"linear");
+  const [pm,setPm]=useState(settings.progressionMode||"linear");
   const [saved,setSaved]=useState(false);
-
-  const handleSave=()=>{
-    onSave({age,sex,weight,progressionMode});
-    setSaved(true);
-    setTimeout(()=>setSaved(false),2000);
-  };
-
+  const handleSave=()=>{onSave({age,sex,weight,progressionMode:pm});setSaved(true);setTimeout(()=>setSaved(false),2000);};
   return (
     <div style={{flex:1,overflowY:"auto",paddingBottom:80}}>
       <div style={{padding:"20px 16px 12px",borderBottom:`1px solid ${C.border}`}}>
@@ -939,68 +947,50 @@ function SettingsScreen({settings,onSave,username,onLogout}) {
         <div style={{color:C.muted,fontSize:13,marginTop:2}}>Signed in as <span style={{color:C.accent,fontWeight:700}}>{username}</span></div>
       </div>
       <div style={{padding:16}}>
-
-        {/* Profile */}
         <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:16,padding:16,marginBottom:16}}>
           <div style={{color:C.text,fontSize:15,fontWeight:700,marginBottom:14}}>Profile</div>
-
           <div style={{marginBottom:14}}>
             <div style={{color:C.mutedLight,fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.8px",marginBottom:6}}>Age</div>
             <input type="number" placeholder="e.g. 28" value={age} onChange={e=>setAge(e.target.value)} style={{...IS,textAlign:"left",padding:"10px 14px",fontSize:15,borderRadius:10,width:"100%"}}/>
           </div>
-
           <div style={{marginBottom:14}}>
             <div style={{color:C.mutedLight,fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.8px",marginBottom:6}}>Biological Sex</div>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}}>
-              {["Male","Female","Other"].map(s=>(
-                <button key={s} onClick={()=>setSex(s)}
-                  style={{background:sex===s?C.accentDim:C.inputBg,border:`1px solid ${sex===s?C.accent:C.inputBorder}`,borderRadius:9,color:sex===s?C.accent:C.muted,cursor:"pointer",fontSize:13,fontWeight:sex===s?700:500,padding:"9px 4px"}}>
-                  {s}
-                </button>
-              ))}
+              {["Male","Female","Other"].map(s=><button key={s} onClick={()=>setSex(s)} style={{background:sex===s?C.accentDim:C.inputBg,border:`1px solid ${sex===s?C.accent:C.inputBorder}`,borderRadius:9,color:sex===s?C.accent:C.muted,cursor:"pointer",fontSize:13,fontWeight:sex===s?700:500,padding:"9px 4px"}}>{s}</button>)}
             </div>
           </div>
-
           <div>
             <div style={{color:C.mutedLight,fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.8px",marginBottom:6}}>Bodyweight (lbs)</div>
             <input type="number" placeholder="e.g. 185" value={weight} onChange={e=>setWeight(e.target.value)} style={{...IS,textAlign:"left",padding:"10px 14px",fontSize:15,borderRadius:10,width:"100%"}}/>
           </div>
         </div>
 
-        {/* Progression Mode */}
         <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:16,padding:16,marginBottom:16}}>
           <div style={{color:C.text,fontSize:15,fontWeight:700,marginBottom:4}}>Progression Logic</div>
           <div style={{color:C.muted,fontSize:12,marginBottom:14,lineHeight:1.5}}>How weights are suggested when starting a template workout</div>
-
-          <div onClick={()=>setProgressionMode("linear")}
-            style={{background:progressionMode==="linear"?C.accentDim:C.inputBg,border:`2px solid ${progressionMode==="linear"?C.accent:C.inputBorder}`,borderRadius:12,padding:14,marginBottom:10,cursor:"pointer"}}>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
-              <div style={{color:progressionMode==="linear"?C.accent:C.text,fontSize:14,fontWeight:700}}>Linear Progression</div>
-              <div style={{width:16,height:16,borderRadius:"50%",border:`2px solid ${progressionMode==="linear"?C.accent:C.muted}`,background:progressionMode==="linear"?C.accent:"transparent",flexShrink:0}}/>
+          {[
+            {id:"linear",title:"Linear Progression",desc:`Tracks your last session's top set. Each workout adds +1 rep at the same weight until the rep cap, then bumps weight +5 lbs and resets reps.`,example:"185×4 → 185×5 → 190×4",col:C.accent,dim:C.accentDim},
+            {id:"e1rm",title:"E1RM Auto-Wave (+1%)",desc:"Averages your estimated 1RM from the last 3 sessions and targets a +1% E1RM increase. Back-calculates weight for your prescribed reps and RPE.",example:"Avg E1RM 245 → Target 247 → Suggests 200×5 @ RPE 8",col:C.purple,dim:C.purpleDim},
+          ].map(opt=>(
+            <div key={opt.id} onClick={()=>setPm(opt.id)}
+              style={{background:pm===opt.id?opt.dim:C.inputBg,border:`2px solid ${pm===opt.id?opt.col:C.inputBorder}`,borderRadius:12,padding:14,marginBottom:10,cursor:"pointer"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                <div style={{color:pm===opt.id?opt.col:C.text,fontSize:14,fontWeight:700}}>{opt.title}</div>
+                <div style={{width:16,height:16,borderRadius:"50%",border:`2px solid ${pm===opt.id?opt.col:C.muted}`,background:pm===opt.id?opt.col:"transparent",flexShrink:0}}/>
+              </div>
+              <div style={{color:C.muted,fontSize:12,lineHeight:1.5}}>{opt.desc}</div>
+              <div style={{marginTop:8,padding:"6px 10px",background:opt.dim,borderRadius:7,color:opt.col,fontSize:11,fontWeight:600}}>Example: {opt.example}</div>
             </div>
-            <div style={{color:C.muted,fontSize:12,lineHeight:1.5}}>Tracks your last session's top set. Each workout adds <span style={{color:C.accent}}>+1 rep</span> at the same weight until the rep cap, then bumps weight <span style={{color:C.accent}}>+5 lbs</span> and resets reps.</div>
-            <div style={{marginTop:8,padding:"6px 10px",background:"#0a1f12",borderRadius:7,color:C.success,fontSize:11,fontWeight:600}}>Example: 185×4 → 185×5 → 190×4</div>
-          </div>
-
-          <div onClick={()=>setProgressionMode("e1rm")}
-            style={{background:progressionMode==="e1rm"?C.purpleDim:C.inputBg,border:`2px solid ${progressionMode==="e1rm"?C.purple:C.inputBorder}`,borderRadius:12,padding:14,cursor:"pointer"}}>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
-              <div style={{color:progressionMode==="e1rm"?C.purple:C.text,fontSize:14,fontWeight:700}}>E1RM Auto-Wave (+1%)</div>
-              <div style={{width:16,height:16,borderRadius:"50%",border:`2px solid ${progressionMode==="e1rm"?C.purple:C.muted}`,background:progressionMode==="e1rm"?C.purple:"transparent",flexShrink:0}}/>
-            </div>
-            <div style={{color:C.muted,fontSize:12,lineHeight:1.5}}>Averages your estimated 1RM from the <span style={{color:C.purple}}>last 3 sessions</span> and targets a <span style={{color:C.purple}}>+1% E1RM increase</span>. Back-calculates weight for your prescribed reps and RPE.</div>
-            <div style={{marginTop:8,padding:"6px 10px",background:C.purpleDim,borderRadius:7,color:C.purple,fontSize:11,fontWeight:600}}>Example: Avg E1RM 245 → Target 247 → Suggests 200×5 @ RPE 8</div>
-          </div>
+          ))}
         </div>
 
-        <button onClick={handleSave}
-          style={{background:saved?"#0d2a1a":C.accent,border:`1px solid ${saved?C.success:C.accent}`,borderRadius:12,color:saved?C.success:"#fff",cursor:"pointer",fontSize:15,fontWeight:700,padding:"14px",width:"100%",marginBottom:12}}>
+        <button onClick={handleSave} style={{background:saved?"#0d2a1a":C.accent,border:`1px solid ${saved?C.success:C.accent}`,borderRadius:12,color:saved?C.success:"#fff",cursor:"pointer",fontSize:15,fontWeight:700,padding:"14px",width:"100%",marginBottom:12}}>
           {saved?"✓ Saved!":"Save Settings"}
         </button>
 
         <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:16,padding:16}}>
           <div style={{color:C.text,fontSize:14,fontWeight:700,marginBottom:4}}>Account</div>
-          <div style={{color:C.muted,fontSize:12,marginBottom:12}}>Your data is saved per account — switching accounts loads a different dataset.</div>
+          <div style={{color:C.muted,fontSize:12,marginBottom:12}}>Your data is saved per account and persists across sessions.</div>
           <button onClick={onLogout} style={{background:"none",border:`1px solid ${C.danger}44`,borderRadius:10,color:C.danger,cursor:"pointer",fontSize:13,fontWeight:700,padding:"10px",width:"100%"}}>Log Out</button>
         </div>
       </div>
@@ -1009,7 +999,7 @@ function SettingsScreen({settings,onSave,username,onLogout}) {
 }
 
 // ─── Bottom Nav ───────────────────────────────────────────────────────────────
-const NAV = [
+const NAV=[
   {id:"home",icon:"🏠",label:"Home"},
   {id:"history",icon:"📋",label:"History"},
   {id:"templates",icon:"📅",label:"Templates"},
@@ -1017,7 +1007,6 @@ const NAV = [
   {id:"progress",icon:"📈",label:"Progress"},
   {id:"settings",icon:"⚙️",label:"Settings"},
 ];
-
 function BottomNav({tab,setTab,activeWorkout}) {
   return (
     <div style={{position:"fixed",bottom:0,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:480,background:C.tabBg,borderTop:`1px solid ${C.border}`,display:"grid",gridTemplateColumns:"repeat(6,1fr)",alignItems:"center",padding:"8px 0 12px",zIndex:50}}>
@@ -1036,7 +1025,7 @@ function BottomNav({tab,setTab,activeWorkout}) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // APP ROOT
 // ═══════════════════════════════════════════════════════════════════════════════
-const DEFAULT_SETTINGS = {age:"",sex:"",weight:"",progressionMode:"linear"};
+const DEFAULT_SETTINGS={age:"",sex:"",weight:"",progressionMode:"linear"};
 
 export default function App() {
   const [authUser,setAuthUser]=useState(null);
@@ -1044,60 +1033,85 @@ export default function App() {
   const [history,setHistory]=useState([]);
   const [templates,setTemplates]=useState([]);
   const [settings,setSettings]=useState(DEFAULT_SETTINGS);
-  const [storageReady,setStorageReady]=useState(false);
+  const [ready,setReady]=useState(false);
   const [flow,setFlow]=useState(null);
 
-  const keyT=u=>`wf-templates-${u}`;
-  const keyH=u=>`wf-history-${u}`;
-  const keyS=u=>`wf-settings-${u}`;
-  const KEY_SESSION="wf-session-v2";
+  // Track whether we've finished loading so we don't write before reading
+  const loadedRef = useRef(false);
 
+  // ── On mount: restore session from shared storage ──────────────────────────
   useEffect(()=>{
     async function init() {
-      const session=await storageGet(KEY_SESSION);
-      if(session?.username) await loadUser(session.username);
-      setStorageReady(true);
+      try {
+        const session = await sGet(SK.session);
+        if (session?.username) {
+          const data = await sGet(SK.data(session.username));
+          if (data) {
+            setTemplates(data.templates || []);
+            setHistory(data.history || []);
+            setSettings(data.settings || DEFAULT_SETTINGS);
+          }
+          setAuthUser(session.username);
+        }
+      } catch(e) { console.error("Init error", e); }
+      loadedRef.current = true;
+      setReady(true);
     }
     init();
   },[]);
 
-  async function loadUser(username) {
-    const [t,h,s]=await Promise.all([storageGet(keyT(username)),storageGet(keyH(username)),storageGet(keyS(username))]);
-    setTemplates(t||[]);
-    setHistory(h||[]);
-    setSettings(s||DEFAULT_SETTINGS);
+  // ── Save all user data atomically whenever anything changes ────────────────
+  // We store everything in ONE key per user to avoid race conditions
+  const saveTimeout = useRef(null);
+  const saveData = (user, tmpl, hist, sett) => {
+    if (!loadedRef.current || !user) return;
+    clearTimeout(saveTimeout.current);
+    saveTimeout.current = setTimeout(()=>{
+      sSet(SK.data(user), { templates: tmpl, history: hist, settings: sett });
+    }, 400); // debounce slightly to batch rapid changes
+  };
+
+  useEffect(()=>{ saveData(authUser, templates, history, settings); },[authUser, templates, history, settings]);
+
+  const handleLogin = async (username) => {
+    // Data was already initialized in AuthScreen for new users
+    // For returning users, load their data
+    const data = await sGet(SK.data(username));
+    setTemplates(data?.templates || []);
+    setHistory(data?.history || []);
+    setSettings(data?.settings || DEFAULT_SETTINGS);
     setAuthUser(username);
-  }
-
-  // Persist on change (guard against firing before user is loaded)
-  const [userLoaded,setUserLoaded]=useState(false);
-  useEffect(()=>{if(storageReady&&authUser){setUserLoaded(true);}else{setUserLoaded(false);}},[storageReady,authUser]);
-  useEffect(()=>{if(!userLoaded)return;storageSet(keyT(authUser),templates);},[templates,userLoaded]);
-  useEffect(()=>{if(!userLoaded)return;storageSet(keyH(authUser),history);},[history,userLoaded]);
-  useEffect(()=>{if(!userLoaded)return;storageSet(keyS(authUser),settings);},[settings,userLoaded]);
-
-  const handleLogin=async(username)=>{
-    await storageSet(KEY_SESSION,{username});
-    await loadUser(username);
   };
-  const handleLogout=()=>{
-    storageSet(KEY_SESSION,null);
-    setAuthUser(null);setHistory([]);setTemplates([]);setSettings(DEFAULT_SETTINGS);
-    setFlow(null);setTab("home");setUserLoaded(false);
+
+  const handleLogout = async () => {
+    await sSet(SK.session, null);
+    setAuthUser(null);
+    setHistory([]);
+    setTemplates([]);
+    setSettings(DEFAULT_SETTINGS);
+    setFlow(null);
+    setTab("home");
   };
-  const handleDeleteWorkout=id=>setHistory(prev=>prev.filter(w=>w.id!==id));
-  const handleStartTemplate=t=>{setFlow({type:"review",template:t});setTab("home");};
-  const handleConfirm=exercises=>setFlow(f=>({type:"live",exercises,title:f.template.name,templateName:f.template.name}));
-  const handleFinish=exercises=>{
-    const entry={
-      id:Date.now(),date:new Date().toISOString().slice(0,10),name:flow.title,templateName:flow.templateName||null,
-      exercises:exercises.map(ex=>({name:ex.name,variant:ex.variant,sets:ex.sets.map(s=>({weight:parseFloat(s.weight)||0,reps:parseFloat(s.reps)||0,rpe:parseFloat(s.rpe)||0}))})),
+
+  const handleDeleteWorkout = id => setHistory(prev => prev.filter(w => w.id !== id));
+  const handleStartTemplate = t => { setFlow({type:"review",template:t}); setTab("home"); };
+  const handleConfirm = exercises => setFlow(f=>({type:"live",exercises,title:f.template.name,templateName:f.template.name}));
+  const handleFinish = exercises => {
+    const entry = {
+      id:Date.now(), date:new Date().toISOString().slice(0,10),
+      name:flow.title, templateName:flow.templateName||null,
+      exercises:exercises.map(ex=>({
+        name:ex.name,variant:ex.variant,
+        sets:ex.sets.map(s=>({weight:parseFloat(s.weight)||0,reps:parseFloat(s.reps)||0,rpe:parseFloat(s.rpe)||0})),
+      })),
     };
     setHistory(prev=>[entry,...prev]);
     setFlow(null);
   };
 
-  const shell=content=>(
+  const pm = settings.progressionMode || "linear";
+
+  const shell = content => (
     <div style={{background:C.bg,minHeight:"100vh",maxWidth:480,margin:"0 auto",display:"flex",flexDirection:"column",fontFamily:"'DM Sans','Segoe UI',sans-serif",color:C.text}}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=DM+Mono:wght@400;600&display=swap');
@@ -1111,16 +1125,20 @@ export default function App() {
     </div>
   );
 
-  if(!storageReady) return shell(<div style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",color:C.muted,fontSize:14,minHeight:"100vh"}}>Loading…</div>);
-  if(!authUser) return shell(<AuthScreen onLogin={handleLogin}/>);
+  if (!ready) return shell(
+    <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",gap:16}}>
+      <div style={{fontSize:40}}>🏋️</div>
+      <div style={{color:C.muted,fontSize:14}}>Loading…</div>
+    </div>
+  );
 
-  const pm=settings.progressionMode||"linear";
+  if (!authUser) return shell(<AuthScreen onLogin={handleLogin}/>);
 
-  if(flow?.type==="review") return shell(
+  if (flow?.type==="review") return shell(
     <><PreWorkoutReview template={flow.template} history={history} onConfirm={handleConfirm} onCancel={()=>setFlow(null)} progressionMode={pm}/>
     <BottomNav tab={tab} setTab={t=>{setFlow(null);setTab(t);}} activeWorkout={true}/></>
   );
-  if(flow?.type==="live") return shell(
+  if (flow?.type==="live") return shell(
     <><LiveWorkoutScreen exercises={flow.exercises} workoutTitle={flow.title} onFinish={handleFinish} onCancel={()=>setTab("home")}/>
     <BottomNav tab={tab} setTab={setTab} activeWorkout={true}/></>
   );
