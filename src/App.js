@@ -206,31 +206,58 @@ function getProgressiveLoad(history, exerciseName, prescription, mode) {
     : getProgressiveLoad_Linear(history, exerciseName, prescription);
 }
 
-// ─── Storage — ALL shared so data survives across sessions ───────────────────
+// ─── Storage — localStorage with window.storage fallback ─────────────────────
 // Keys:
-//   wf3:users          → { [username]: { hash } }          (shared)
-//   wf3:session        → { username }                       (shared)
-//   wf3:data:[user]    → { templates, history, settings }  (shared)
+//   wf3:users          → { [username]: { hash } }
+//   wf3:session        → { username }
+//   wf3:data:[user]    → { templates, history, settings }
 
 const SK = {
-  users:    "wf3:users",
-  session:  "wf3:session",
-  data:     u => `wf3:data:${u}`,
+  users:   "wf3:users",
+  session: "wf3:session",
+  data:    u => `wf3:data:${u}`,
 };
 
-async function sGet(key) {
+// Detect which storage backend is available
+function getBackend() {
   try {
-    const r = await window.storage.get(key, true);
-    if (!r || !r.value) return null;
-    return JSON.parse(r.value);
-  } catch { return null; }
+    if (window.storage && typeof window.storage.get === "function") return "claude";
+  } catch {}
+  try {
+    localStorage.setItem("__wf_test__", "1");
+    localStorage.removeItem("__wf_test__");
+    return "local";
+  } catch {}
+  return null;
+}
+
+async function sGet(key) {
+  const backend = getBackend();
+  try {
+    if (backend === "claude") {
+      const r = await window.storage.get(key, true);
+      if (!r || !r.value) return null;
+      return JSON.parse(r.value);
+    } else if (backend === "local") {
+      const raw = localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : null;
+    }
+  } catch {}
+  return null;
 }
 
 async function sSet(key, val) {
+  const backend = getBackend();
   try {
-    await window.storage.set(key, JSON.stringify(val), true);
-    return true;
-  } catch { return false; }
+    if (backend === "claude") {
+      await window.storage.set(key, JSON.stringify(val), true);
+      return true;
+    } else if (backend === "local") {
+      localStorage.setItem(key, JSON.stringify(val));
+      return true;
+    }
+  } catch {}
+  return false;
 }
 
 function hashPass(username, password) {
@@ -272,6 +299,8 @@ function AuthScreen({ onLogin }) {
   // Test storage on mount
   useEffect(() => {
     async function test() {
+      const backend = getBackend();
+      if (!backend) { setStorageOk(false); return; }
       const ok = await sSet("wf3:ping", { t: Date.now() });
       setStorageOk(ok);
     }
