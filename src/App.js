@@ -206,62 +206,92 @@ function getProgressiveLoad(history, exerciseName, prescription, mode) {
     : getProgressiveLoad_Linear(history, exerciseName, prescription);
 }
 
-// ─── Storage — localStorage with window.storage fallback ─────────────────────
-// Keys:
-//   wf3:users          → { [username]: { hash } }
-//   wf3:session        → { username }
-//   wf3:data:[user]    → { templates, history, settings }
+// ─── Cloud Storage via JSONBin.io ─────────────────────────────────────────────
+// All data stored server-side — works on iOS PWA, Safari, any device.
+// One "master bin" holds the full app DB:
+//   { users: { [username]: { hash } }, data: { [username]: { templates, history, settings } } }
+// The bin ID is created on first run and cached in localStorage (just a pointer, not data).
 
-const SK = {
-  users:   "wf3:users",
-  session: "wf3:session",
-  data:    u => `wf3:data:${u}`,
-};
+const JSONBIN_API = "https://api.jsonbin.io/v3";
+const BIN_KEY = "wf_bin_id";
+const SESSION_KEY = "wf_session";
 
-// Detect which storage backend is available
-function getBackend() {
+let _binId = null;
+let _db = null;
+let _saveTimer = null;
+
+async function createBin() {
   try {
-    if (window.storage && typeof window.storage.get === "function") return "claude";
-  } catch {}
-  try {
-    localStorage.setItem("__wf_test__", "1");
-    localStorage.removeItem("__wf_test__");
-    return "local";
-  } catch {}
-  return null;
+    const res = await fetch(`${JSONBIN_API}/b`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Bin-Name": "WorkoutFlowDB", "X-Bin-Private": "false" },
+      body: JSON.stringify({ users: {}, data: {} }),
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const id = json.metadata?.id;
+    if (id) { try { localStorage.setItem(BIN_KEY, id); } catch {} }
+    return id;
+  } catch { return null; }
 }
 
-async function sGet(key) {
-  const backend = getBackend();
+async function fetchDB(binId) {
   try {
-    if (backend === "claude") {
-      const r = await window.storage.get(key, true);
-      if (!r || !r.value) return null;
-      return JSON.parse(r.value);
-    } else if (backend === "local") {
-      const raw = localStorage.getItem(key);
-      return raw ? JSON.parse(raw) : null;
-    }
-  } catch {}
-  return null;
+    const res = await fetch(`${JSONBIN_API}/b/${binId}/latest`, {
+      headers: { "X-Bin-Meta": "false" },
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch { return null; }
 }
 
-async function sSet(key, val) {
-  const backend = getBackend();
+async function pushDB(binId, db) {
   try {
-    if (backend === "claude") {
-      await window.storage.set(key, JSON.stringify(val), true);
-      return true;
-    } else if (backend === "local") {
-      localStorage.setItem(key, JSON.stringify(val));
-      return true;
-    }
-  } catch {}
-  return false;
+    const res = await fetch(`${JSONBIN_API}/b/${binId}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(db),
+    });
+    return res.ok;
+  } catch { return false; }
+}
+
+async function getBinId() {
+  if (_binId) return _binId;
+  try { _binId = localStorage.getItem(BIN_KEY); } catch {}
+  if (_binId) return _binId;
+  _binId = await createBin();
+  return _binId;
+}
+
+async function loadDB() {
+  if (_db) return _db;
+  const binId = await getBinId();
+  if (!binId) return { users: {}, data: {} };
+  const db = await fetchDB(binId);
+  _db = db || { users: {}, data: {} };
+  return _db;
+}
+
+function scheduleSave() {
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(async () => {
+    const binId = await getBinId();
+    if (binId && _db) await pushDB(binId, _db);
+  }, 800);
+}
+
+function getSession() {
+  try { const s = localStorage.getItem(SESSION_KEY); return s ? JSON.parse(s) : null; } catch { return null; }
+}
+function setSession(val) {
+  try { localStorage.setItem(SESSION_KEY, JSON.stringify(val)); } catch {}
+}
+function clearSession() {
+  try { localStorage.removeItem(SESSION_KEY); } catch {}
 }
 
 function hashPass(username, password) {
-  // Simple deterministic hash — not cryptographic but sufficient for this use case
   const str = `${username}|${password}|wf3`;
   let h = 0;
   for (let i = 0; i < str.length; i++) {
@@ -269,6 +299,7 @@ function hashPass(username, password) {
   }
   return h.toString(36);
 }
+
 
 // ─── Colors ───────────────────────────────────────────────────────────────────
 const C = {
@@ -288,52 +319,46 @@ const IS = {
 // ═══════════════════════════════════════════════════════════════════════════════
 // AUTH SCREEN
 // ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// AUTH SCREEN
+// ═══════════════════════════════════════════════════════════════════════════════
 function AuthScreen({ onLogin }) {
   const [mode, setMode] = useState("login");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-  const [storageOk, setStorageOk] = useState(null); // null=checking, true, false
-
-  // Test storage on mount
-  useEffect(() => {
-    async function test() {
-      const backend = getBackend();
-      if (!backend) { setStorageOk(false); return; }
-      const ok = await sSet("wf3:ping", { t: Date.now() });
-      setStorageOk(ok);
-    }
-    test();
-  }, []);
+  const [status, setStatus] = useState("idle"); // "idle" | "connecting"
 
   const handleSubmit = async () => {
-    setError(""); setLoading(true);
+    setError(""); setLoading(true); setStatus("connecting");
     const u = username.trim().toLowerCase().replace(/[^a-z0-9_]/g, "_");
     const p = password.trim();
-    if (!u || !p) { setError("Fill in both fields."); setLoading(false); return; }
-    if (u.length < 3) { setError("Username must be at least 3 characters."); setLoading(false); return; }
-    if (p.length < 4) { setError("Password must be at least 4 characters."); setLoading(false); return; }
+    if (!u || !p) { setError("Fill in both fields."); setLoading(false); setStatus("idle"); return; }
+    if (u.length < 3) { setError("Username must be at least 3 characters."); setLoading(false); setStatus("idle"); return; }
+    if (p.length < 4) { setError("Password must be at least 4 characters."); setLoading(false); setStatus("idle"); return; }
 
-    const users = (await sGet(SK.users)) || {};
+    const db = await loadDB();
     const hash = hashPass(u, p);
 
     if (mode === "signup") {
-      if (users[u]) { setError("Username taken. Try logging in."); setLoading(false); return; }
-      users[u] = { hash, created: Date.now() };
-      const saved = await sSet(SK.users, users);
-      if (!saved) { setError("Storage error — could not save account."); setLoading(false); return; }
-      // Initialize empty data for new user
-      await sSet(SK.data(u), { templates: [], history: [], settings: { age:"", sex:"", weight:"", progressionMode:"linear" } });
-      await sSet(SK.session, { username: u });
+      if (db.users[u]) { setError("Username taken. Try logging in."); setLoading(false); setStatus("idle"); return; }
+      db.users[u] = { hash, created: Date.now() };
+      db.data = db.data || {};
+      db.data[u] = { templates: [], history: [], settings: { age:"", sex:"", weight:"", progressionMode:"linear" } };
+      const binId = await getBinId();
+      const ok = await pushDB(binId, db);
+      if (!ok) { setError("Network error — check your connection and retry."); setLoading(false); setStatus("idle"); return; }
+      _db = db; // update cache
+      setSession({ username: u });
       onLogin(u);
     } else {
-      if (!users[u]) { setError("No account found. Sign up first."); setLoading(false); return; }
-      if (users[u].hash !== hash) { setError("Incorrect password."); setLoading(false); return; }
-      await sSet(SK.session, { username: u });
+      if (!db.users[u]) { setError("No account found. Sign up first."); setLoading(false); setStatus("idle"); return; }
+      if (db.users[u].hash !== hash) { setError("Incorrect password."); setLoading(false); setStatus("idle"); return; }
+      setSession({ username: u });
       onLogin(u);
     }
-    setLoading(false);
+    setLoading(false); setStatus("idle");
   };
 
   return (
@@ -343,12 +368,6 @@ function AuthScreen({ onLogin }) {
         <div style={{color:C.text,fontSize:28,fontWeight:800,letterSpacing:"-0.5px"}}>Workout Flow</div>
         <div style={{color:C.muted,fontSize:14,marginTop:4}}>Track. Analyze. Progress.</div>
       </div>
-
-      {storageOk === false && (
-        <div style={{background:"#3b1515",border:`1px solid ${C.danger}`,borderRadius:12,color:C.danger,fontSize:13,padding:"12px 16px",marginBottom:16,maxWidth:380,width:"100%",textAlign:"center",lineHeight:1.5}}>
-          ⚠️ Storage unavailable. Accounts won't persist. Try refreshing the page.
-        </div>
-      )}
 
       <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:20,padding:24,width:"100%",maxWidth:380}}>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:24,background:C.inputBg,borderRadius:12,padding:4}}>
@@ -375,9 +394,9 @@ function AuthScreen({ onLogin }) {
 
         {error && <div style={{background:"#3b1515",border:`1px solid ${C.danger}44`,borderRadius:9,color:C.danger,fontSize:13,padding:"9px 14px",marginBottom:16,textAlign:"center"}}>{error}</div>}
 
-        <button onClick={handleSubmit} disabled={loading || storageOk===false}
-          style={{background:C.accent,border:"none",borderRadius:12,color:"#fff",cursor:loading?"default":"pointer",fontSize:15,fontWeight:700,padding:"14px",width:"100%",opacity:(loading||storageOk===false)?0.6:1}}>
-          {loading?"…":mode==="login"?"Log In →":"Create Account →"}
+        <button onClick={handleSubmit} disabled={loading}
+          style={{background:C.accent,border:"none",borderRadius:12,color:"#fff",cursor:loading?"default":"pointer",fontSize:15,fontWeight:700,padding:"14px",width:"100%",opacity:loading?0.6:1}}>
+          {status==="connecting"?"Connecting…":mode==="login"?"Log In →":"Create Account →"}
         </button>
 
         <div style={{textAlign:"center",marginTop:16,color:C.muted,fontSize:13}}>
@@ -391,7 +410,6 @@ function AuthScreen({ onLogin }) {
   );
 }
 
-// ─── Exercise Picker ──────────────────────────────────────────────────────────
 function ExercisePicker({ onSelect, onClose }) {
   const [search,setSearch]=useState("");
   const [selCat,setSelCat]=useState(null);
@@ -1054,6 +1072,9 @@ function BottomNav({tab,setTab,activeWorkout}) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // APP ROOT
 // ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// APP ROOT
+// ═══════════════════════════════════════════════════════════════════════════════
 const DEFAULT_SETTINGS={age:"",sex:"",weight:"",progressionMode:"linear"};
 
 export default function App() {
@@ -1065,22 +1086,27 @@ export default function App() {
   const [ready,setReady]=useState(false);
   const [flow,setFlow]=useState(null);
 
-  // Track whether we've finished loading so we don't write before reading
   const loadedRef = useRef(false);
 
-  // ── On mount: restore session from shared storage ──────────────────────────
+  // ── On mount: restore session then load user data from cloud ───────────────
   useEffect(()=>{
     async function init() {
       try {
-        const session = await sGet(SK.session);
+        const session = getSession(); // localStorage — just a pointer to username
         if (session?.username) {
-          const data = await sGet(SK.data(session.username));
-          if (data) {
-            setTemplates(data.templates || []);
-            setHistory(data.history || []);
-            setSettings(data.settings || DEFAULT_SETTINGS);
+          const db = await loadDB();
+          const userData = db.data?.[session.username];
+          if (userData) {
+            setTemplates(userData.templates || []);
+            setHistory(userData.history || []);
+            setSettings(userData.settings || DEFAULT_SETTINGS);
           }
-          setAuthUser(session.username);
+          // Verify the user still exists in the DB
+          if (db.users?.[session.username]) {
+            setAuthUser(session.username);
+          } else {
+            clearSession(); // stale session
+          }
         }
       } catch(e) { console.error("Init error", e); }
       loadedRef.current = true;
@@ -1089,31 +1115,27 @@ export default function App() {
     init();
   },[]);
 
-  // ── Save all user data atomically whenever anything changes ────────────────
-  // We store everything in ONE key per user to avoid race conditions
-  const saveTimeout = useRef(null);
-  const saveData = (user, tmpl, hist, sett) => {
-    if (!loadedRef.current || !user) return;
-    clearTimeout(saveTimeout.current);
-    saveTimeout.current = setTimeout(()=>{
-      sSet(SK.data(user), { templates: tmpl, history: hist, settings: sett });
-    }, 400); // debounce slightly to batch rapid changes
-  };
-
-  useEffect(()=>{ saveData(authUser, templates, history, settings); },[authUser, templates, history, settings]);
+  // ── Persist user data to cloud whenever state changes ─────────────────────
+  useEffect(()=>{
+    if (!loadedRef.current || !authUser) return;
+    if (!_db) return;
+    _db.data = _db.data || {};
+    _db.data[authUser] = { templates, history, settings };
+    scheduleSave();
+  },[authUser, templates, history, settings]);
 
   const handleLogin = async (username) => {
-    // Data was already initialized in AuthScreen for new users
-    // For returning users, load their data
-    const data = await sGet(SK.data(username));
-    setTemplates(data?.templates || []);
-    setHistory(data?.history || []);
-    setSettings(data?.settings || DEFAULT_SETTINGS);
+    // DB already loaded/updated in AuthScreen, just pull from cache
+    const db = _db || await loadDB();
+    const userData = db.data?.[username] || {};
+    setTemplates(userData.templates || []);
+    setHistory(userData.history || []);
+    setSettings(userData.settings || DEFAULT_SETTINGS);
     setAuthUser(username);
   };
 
-  const handleLogout = async () => {
-    await sSet(SK.session, null);
+  const handleLogout = () => {
+    clearSession();
     setAuthUser(null);
     setHistory([]);
     setTemplates([]);
