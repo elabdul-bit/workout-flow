@@ -206,78 +206,77 @@ function getProgressiveLoad(history, exerciseName, prescription, mode) {
     : getProgressiveLoad_Linear(history, exerciseName, prescription);
 }
 
-// ─── Cloud Storage via JSONBin.io ─────────────────────────────────────────────
-// All data stored server-side — works on iOS PWA, Safari, any device.
-// One "master bin" holds the full app DB:
-//   { users: { [username]: { hash } }, data: { [username]: { templates, history, settings } } }
-// The bin ID is created on first run and cached in localStorage (just a pointer, not data).
+// ─── Storage: Supabase ────────────────────────────────────────────────────────
+// Supabase is free, CORS-safe, and works perfectly on iOS PWA.
+// Setup takes ~2 minutes:
+//   1. Go to https://supabase.com → New project (free)
+//   2. Go to Project Settings → API
+//   3. Copy "Project URL" → paste as SUPABASE_URL below
+//   4. Copy "anon public" key → paste as SUPABASE_ANON_KEY below
+//   5. Go to SQL Editor and run:
+//        create table if not exists wf_users (id text primary key, data jsonb);
+//        create table if not exists wf_data  (id text primary key, data jsonb);
+//        alter table wf_users enable row level security;
+//        alter table wf_data  enable row level security;
+//        create policy "public" on wf_users for all using (true) with check (true);
+//        create policy "public" on wf_data  for all using (true) with check (true);
 
-const JSONBIN_API = "https://api.jsonbin.io/v3";
-const BIN_KEY = "wf_bin_id";
-const SESSION_KEY = "wf_session";
+const SUPABASE_URL     = "https://wkkfrpbnmptxhyzhcpfd.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_H3smLLowfkpVDXckgLrtBA_321sJwE0";
+const SESSION_KEY = "wf_session_v5";
 
-let _binId = null;
-let _db = null;
-let _saveTimer = null;
+const isConfigured = () =>
+  SUPABASE_URL !== "PASTE_YOUR_PROJECT_URL_HERE" &&
+  SUPABASE_ANON_KEY !== "PASTE_YOUR_ANON_KEY_HERE";
 
-async function createBin() {
+let _cache = {};
+let _saveTimers = {};
+
+const sbHeaders = () => ({
+  "Content-Type": "application/json",
+  "apikey": SUPABASE_ANON_KEY,
+  "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
+  "Prefer": "return=minimal",
+});
+
+// Read a row from a Supabase table by id; returns the `data` field or null
+async function dbGet(table, id) {
+  const key = `${table}/${id}`;
+  if (_cache[key] !== undefined) return _cache[key];
   try {
-    const res = await fetch(`${JSONBIN_API}/b`, {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/${table}?id=eq.${encodeURIComponent(id)}&select=data`,
+      { headers: { ...sbHeaders(), "Prefer": "return=representation" } }
+    );
+    if (!res.ok) return null;
+    const rows = await res.json();
+    const val = rows.length > 0 ? rows[0].data : null;
+    _cache[key] = val;
+    return val;
+  } catch { return null; }
+}
+
+// Upsert a row; returns true on success
+async function dbSet(table, id, data) {
+  const key = `${table}/${id}`;
+  _cache[key] = data; // optimistic
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Bin-Name": "WorkoutFlowDB", "X-Bin-Private": "false" },
-      body: JSON.stringify({ users: {}, data: {} }),
-    });
-    if (!res.ok) return null;
-    const json = await res.json();
-    const id = json.metadata?.id;
-    if (id) { try { localStorage.setItem(BIN_KEY, id); } catch {} }
-    return id;
-  } catch { return null; }
-}
-
-async function fetchDB(binId) {
-  try {
-    const res = await fetch(`${JSONBIN_API}/b/${binId}/latest`, {
-      headers: { "X-Bin-Meta": "false" },
-    });
-    if (!res.ok) return null;
-    return await res.json();
-  } catch { return null; }
-}
-
-async function pushDB(binId, db) {
-  try {
-    const res = await fetch(`${JSONBIN_API}/b/${binId}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(db),
+      headers: { ...sbHeaders(), "Prefer": "resolution=merge-duplicates" },
+      body: JSON.stringify({ id, data }),
     });
     return res.ok;
   } catch { return false; }
 }
 
-async function getBinId() {
-  if (_binId) return _binId;
-  try { _binId = localStorage.getItem(BIN_KEY); } catch {}
-  if (_binId) return _binId;
-  _binId = await createBin();
-  return _binId;
-}
-
-async function loadDB() {
-  if (_db) return _db;
-  const binId = await getBinId();
-  if (!binId) return { users: {}, data: {} };
-  const db = await fetchDB(binId);
-  _db = db || { users: {}, data: {} };
-  return _db;
-}
-
-function scheduleSave() {
-  clearTimeout(_saveTimer);
-  _saveTimer = setTimeout(async () => {
-    const binId = await getBinId();
-    if (binId && _db) await pushDB(binId, _db);
+// Debounced write — batches rapid changes into one network call
+function scheduleWrite(table, id, getData) {
+  const key = `${table}/${id}`;
+  clearTimeout(_saveTimers[key]);
+  _saveTimers[key] = setTimeout(async () => {
+    const data = getData();
+    if (data) await dbSet(table, id, data);
   }, 800);
 }
 
@@ -285,21 +284,18 @@ function getSession() {
   try { const s = localStorage.getItem(SESSION_KEY); return s ? JSON.parse(s) : null; } catch { return null; }
 }
 function setSession(val) {
-  try { localStorage.setItem(SESSION_KEY, JSON.stringify(val)); } catch {}
+  try { localStorage.setItem(SESSION_KEY, val ? JSON.stringify(val) : ""); } catch {}
 }
 function clearSession() {
   try { localStorage.removeItem(SESSION_KEY); } catch {}
 }
 
 function hashPass(username, password) {
-  const str = `${username}|${password}|wf3`;
+  const str = `${username}|${password}|wf5`;
   let h = 0;
-  for (let i = 0; i < str.length; i++) {
-    h = Math.imul(31, h) + str.charCodeAt(i) | 0;
-  }
+  for (let i = 0; i < str.length; i++) { h = Math.imul(31, h) + str.charCodeAt(i) | 0; }
   return h.toString(36);
 }
-
 
 // ─── Colors ───────────────────────────────────────────────────────────────────
 const C = {
@@ -322,43 +318,99 @@ const IS = {
 // ═══════════════════════════════════════════════════════════════════════════════
 // AUTH SCREEN
 // ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// AUTH SCREEN
+// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// SETUP SCREEN (shown when Supabase isn't configured yet)
+// ═══════════════════════════════════════════════════════════════════════════════
+function SetupScreen() {
+  return (
+    <div style={{minHeight:"100vh",background:C.bg,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24}}>
+      <div style={{marginBottom:28,textAlign:"center"}}>
+        <div style={{fontSize:48,marginBottom:8}}>🏋️</div>
+        <div style={{color:C.text,fontSize:26,fontWeight:800}}>Workout Flow</div>
+        <div style={{color:C.muted,fontSize:13,marginTop:4}}>One-time setup needed</div>
+      </div>
+      <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:20,padding:24,width:"100%",maxWidth:420}}>
+        <div style={{color:C.warning,fontSize:15,fontWeight:700,marginBottom:12}}>⚡ Connect Your Database</div>
+        <div style={{color:C.mutedLight,fontSize:13,lineHeight:1.7,marginBottom:20}}>
+          This app needs a free Supabase backend so your data persists on iOS. Takes ~3 minutes:
+        </div>
+        {[
+          { n:"1", t:"Create free project", d:"Go to supabase.com → New project. No credit card needed.", link:"https://supabase.com", lbl:"Open Supabase →" },
+          { n:"2", t:"Run this SQL", d:"In Supabase → SQL Editor, paste and run:", code:
+`create table if not exists wf_users (id text primary key, data jsonb);
+create table if not exists wf_data  (id text primary key, data jsonb);
+alter table wf_users enable row level security;
+alter table wf_data  enable row level security;
+create policy "pub_users" on wf_users for all using (true) with check (true);
+create policy "pub_data"  on wf_data  for all using (true) with check (true);` },
+          { n:"3", t:"Paste your credentials", d:"In your code file, find these two lines near the top and replace the placeholder text with your values from Project Settings → API:", code:`const SUPABASE_URL      = "PASTE_YOUR_PROJECT_URL_HERE";\nconst SUPABASE_ANON_KEY = "PASTE_YOUR_ANON_KEY_HERE";` },
+        ].map(step => (
+          <div key={step.n} style={{background:C.inputBg,border:`1px solid ${C.inputBorder}`,borderRadius:14,padding:14,marginBottom:12}}>
+            <div style={{display:"flex",gap:10,alignItems:"flex-start",marginBottom:step.code?10:0}}>
+              <div style={{background:C.accentDim,color:C.accent,borderRadius:"50%",width:22,height:22,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:800,fontSize:12,flexShrink:0}}>{step.n}</div>
+              <div>
+                <div style={{color:C.text,fontSize:14,fontWeight:700}}>{step.t}</div>
+                <div style={{color:C.muted,fontSize:12,marginTop:3,lineHeight:1.5}}>{step.d}</div>
+              </div>
+            </div>
+            {step.code && (
+              <pre style={{background:"#0a0a10",border:`1px solid ${C.border}`,borderRadius:8,padding:"10px 12px",fontSize:10,color:C.success,overflowX:"auto",margin:0,lineHeight:1.6,whiteSpace:"pre-wrap",wordBreak:"break-all"}}>{step.code}</pre>
+            )}
+            {step.link && (
+              <a href={step.link} target="_blank" rel="noreferrer"
+                style={{display:"inline-block",marginTop:8,background:C.accentDim,border:`1px solid ${C.accent}`,borderRadius:8,color:C.accent,fontSize:12,fontWeight:700,padding:"6px 14px",textDecoration:"none"}}>
+                {step.lbl}
+              </a>
+            )}
+          </div>
+        ))}
+        <div style={{color:C.muted,fontSize:11,textAlign:"center",marginTop:4,lineHeight:1.5}}>
+          After pasting your credentials and redeploying, this screen will be replaced by the login screen.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AUTH SCREEN
+// ═══════════════════════════════════════════════════════════════════════════════
 function AuthScreen({ onLogin }) {
   const [mode, setMode] = useState("login");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-  const [status, setStatus] = useState("idle"); // "idle" | "connecting"
 
   const handleSubmit = async () => {
-    setError(""); setLoading(true); setStatus("connecting");
+    setError(""); setLoading(true);
     const u = username.trim().toLowerCase().replace(/[^a-z0-9_]/g, "_");
     const p = password.trim();
-    if (!u || !p) { setError("Fill in both fields."); setLoading(false); setStatus("idle"); return; }
-    if (u.length < 3) { setError("Username must be at least 3 characters."); setLoading(false); setStatus("idle"); return; }
-    if (p.length < 4) { setError("Password must be at least 4 characters."); setLoading(false); setStatus("idle"); return; }
+    if (!u || !p) { setError("Fill in both fields."); setLoading(false); return; }
+    if (u.length < 3) { setError("Username must be at least 3 characters."); setLoading(false); return; }
+    if (p.length < 4) { setError("Password must be at least 4 characters."); setLoading(false); return; }
 
-    const db = await loadDB();
     const hash = hashPass(u, p);
 
     if (mode === "signup") {
-      if (db.users[u]) { setError("Username taken. Try logging in."); setLoading(false); setStatus("idle"); return; }
-      db.users[u] = { hash, created: Date.now() };
-      db.data = db.data || {};
-      db.data[u] = { templates: [], history: [], settings: { age:"", sex:"", weight:"", progressionMode:"linear" } };
-      const binId = await getBinId();
-      const ok = await pushDB(binId, db);
-      if (!ok) { setError("Network error — check your connection and retry."); setLoading(false); setStatus("idle"); return; }
-      _db = db; // update cache
+      const existing = await dbGet("wf_users", u);
+      if (existing) { setError("Username taken. Try logging in."); setLoading(false); return; }
+      const ok = await dbSet("wf_users", u, { hash, created: Date.now() });
+      if (!ok) { setError("Network error — check connection and retry."); setLoading(false); return; }
+      await dbSet("wf_data", u, { templates:[], history:[], settings:{ age:"",sex:"",weight:"",progressionMode:"linear" } });
       setSession({ username: u });
       onLogin(u);
     } else {
-      if (!db.users[u]) { setError("No account found. Sign up first."); setLoading(false); setStatus("idle"); return; }
-      if (db.users[u].hash !== hash) { setError("Incorrect password."); setLoading(false); setStatus("idle"); return; }
+      const user = await dbGet("wf_users", u);
+      if (!user) { setError("No account found. Sign up first."); setLoading(false); return; }
+      if (user.hash !== hash) { setError("Incorrect password."); setLoading(false); return; }
       setSession({ username: u });
       onLogin(u);
     }
-    setLoading(false); setStatus("idle");
+    setLoading(false);
   };
 
   return (
@@ -368,7 +420,6 @@ function AuthScreen({ onLogin }) {
         <div style={{color:C.text,fontSize:28,fontWeight:800,letterSpacing:"-0.5px"}}>Workout Flow</div>
         <div style={{color:C.muted,fontSize:14,marginTop:4}}>Track. Analyze. Progress.</div>
       </div>
-
       <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:20,padding:24,width:"100%",maxWidth:380}}>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:24,background:C.inputBg,borderRadius:12,padding:4}}>
           {["login","signup"].map(m=>(
@@ -378,7 +429,6 @@ function AuthScreen({ onLogin }) {
             </button>
           ))}
         </div>
-
         <div style={{marginBottom:14}}>
           <div style={{color:C.mutedLight,fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.8px",marginBottom:6}}>Username</div>
           <input type="text" placeholder="your_username" value={username}
@@ -391,14 +441,11 @@ function AuthScreen({ onLogin }) {
             onChange={e=>setPassword(e.target.value)} onKeyDown={e=>e.key==="Enter"&&handleSubmit()}
             style={{...IS,textAlign:"left",padding:"11px 14px",fontSize:15,borderRadius:10,width:"100%"}}/>
         </div>
-
         {error && <div style={{background:"#3b1515",border:`1px solid ${C.danger}44`,borderRadius:9,color:C.danger,fontSize:13,padding:"9px 14px",marginBottom:16,textAlign:"center"}}>{error}</div>}
-
         <button onClick={handleSubmit} disabled={loading}
           style={{background:C.accent,border:"none",borderRadius:12,color:"#fff",cursor:loading?"default":"pointer",fontSize:15,fontWeight:700,padding:"14px",width:"100%",opacity:loading?0.6:1}}>
-          {status==="connecting"?"Connecting…":mode==="login"?"Log In →":"Create Account →"}
+          {loading?"Connecting…":mode==="login"?"Log In →":"Create Account →"}
         </button>
-
         <div style={{textAlign:"center",marginTop:16,color:C.muted,fontSize:13}}>
           {mode==="login"?"No account? ":"Have an account? "}
           <span onClick={()=>{setMode(mode==="login"?"signup":"login");setError("");}} style={{color:C.accent,cursor:"pointer",fontWeight:700}}>
@@ -1075,6 +1122,12 @@ function BottomNav({tab,setTab,activeWorkout}) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // APP ROOT
 // ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// APP ROOT
+// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// APP ROOT
+// ═══════════════════════════════════════════════════════════════════════════════
 const DEFAULT_SETTINGS={age:"",sex:"",weight:"",progressionMode:"linear"};
 
 export default function App() {
@@ -1085,63 +1138,61 @@ export default function App() {
   const [settings,setSettings]=useState(DEFAULT_SETTINGS);
   const [ready,setReady]=useState(false);
   const [flow,setFlow]=useState(null);
-
   const loadedRef = useRef(false);
 
-  // ── On mount: restore session then load user data from cloud ───────────────
+  // Show setup screen if credentials haven't been filled in
+  if (!isConfigured()) {
+    return (
+      <div style={{background:C.bg,minHeight:"100vh",maxWidth:480,margin:"0 auto",fontFamily:"'DM Sans','Segoe UI',sans-serif",color:C.text}}>
+        <style>{`*{box-sizing:border-box;margin:0;padding:0;} ::-webkit-scrollbar{width:4px;}`}</style>
+        <SetupScreen/>
+      </div>
+    );
+  }
+
+  // ── On mount: restore session → load user data ─────────────────────────────
   useEffect(()=>{
     async function init() {
       try {
-        const session = getSession(); // localStorage — just a pointer to username
+        const session = getSession();
         if (session?.username) {
-          const db = await loadDB();
-          const userData = db.data?.[session.username];
-          if (userData) {
-            setTemplates(userData.templates || []);
-            setHistory(userData.history || []);
-            setSettings(userData.settings || DEFAULT_SETTINGS);
-          }
-          // Verify the user still exists in the DB
-          if (db.users?.[session.username]) {
+          const user = await dbGet("wf_users", session.username);
+          if (user) {
+            const userData = await dbGet("wf_data", session.username);
+            setTemplates(userData?.templates || []);
+            setHistory(userData?.history || []);
+            setSettings(userData?.settings || DEFAULT_SETTINGS);
             setAuthUser(session.username);
           } else {
-            clearSession(); // stale session
+            clearSession();
           }
         }
-      } catch(e) { console.error("Init error", e); }
+      } catch(e) { console.error("Init:", e); }
       loadedRef.current = true;
       setReady(true);
     }
     init();
   },[]);
 
-  // ── Persist user data to cloud whenever state changes ─────────────────────
+  // ── Debounced save whenever user data changes ──────────────────────────────
   useEffect(()=>{
     if (!loadedRef.current || !authUser) return;
-    if (!_db) return;
-    _db.data = _db.data || {};
-    _db.data[authUser] = { templates, history, settings };
-    scheduleSave();
+    scheduleWrite("wf_data", authUser, () => ({ templates, history, settings }));
   },[authUser, templates, history, settings]);
 
   const handleLogin = async (username) => {
-    // DB already loaded/updated in AuthScreen, just pull from cache
-    const db = _db || await loadDB();
-    const userData = db.data?.[username] || {};
-    setTemplates(userData.templates || []);
-    setHistory(userData.history || []);
-    setSettings(userData.settings || DEFAULT_SETTINGS);
+    const userData = await dbGet("wf_data", username);
+    setTemplates(userData?.templates || []);
+    setHistory(userData?.history || []);
+    setSettings(userData?.settings || DEFAULT_SETTINGS);
     setAuthUser(username);
   };
 
   const handleLogout = () => {
     clearSession();
-    setAuthUser(null);
-    setHistory([]);
-    setTemplates([]);
-    setSettings(DEFAULT_SETTINGS);
-    setFlow(null);
-    setTab("home");
+    delete _cache[`wf_users/${authUser}`];
+    delete _cache[`wf_data/${authUser}`];
+    setAuthUser(null); setHistory([]); setTemplates([]); setSettings(DEFAULT_SETTINGS); setFlow(null); setTab("home");
   };
 
   const handleDeleteWorkout = id => setHistory(prev => prev.filter(w => w.id !== id));
